@@ -38,13 +38,57 @@ RUNTIME_DIR = Path(__file__).resolve().parent
 if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
 
-from charger_api import fetch_station  # noqa: E402
+from charger_api import HEADERS, PROXIES, fetch_station  # noqa: E402
 from charge_history_backend import HistoryDatabase, iso_utc, load_station_map  # noqa: E402
 
 SHARD_VERSION = 1
 DEFAULT_STATIONS = RUNTIME_DIR / "all.json"
 DEFAULT_OUT_DIR = "gha_data"
 DEFAULT_WORKERS = 8
+
+
+def probe_api(station_id: int) -> Dict[str, Any]:
+    """
+    连通性自检：DNS → TCP → HTTPS 三段分别计时，任何一段失败都记下原始异常。
+
+    GitHub 的 runner 在境外，上游接口在国内。跑失败时如果没有这个自检，
+    日志里只剩一句「接口返回空数据」，根本分不清是 DNS、连接超时还是被限流。
+    """
+    import socket
+
+    import requests
+
+    host = "wemp.issks.com"
+    url = "https://{}/charge/v1/outlet/station/outlets/{}".format(host, station_id)
+    result: Dict[str, Any] = {"host": host, "url": url}
+
+    t0 = time.monotonic()
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        result["dns_ms"] = round((time.monotonic() - t0) * 1000)
+        result["ips"] = sorted({info[4][0] for info in infos})
+    except Exception as exc:
+        result["dns_error"] = repr(exc)
+        return result
+
+    t0 = time.monotonic()
+    try:
+        sock = socket.create_connection((result["ips"][0], 443), timeout=8)
+        result["tcp_ms"] = round((time.monotonic() - t0) * 1000)
+        sock.close()
+    except Exception as exc:
+        result["tcp_error"] = repr(exc)
+        return result
+
+    t0 = time.monotonic()
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10, proxies=PROXIES)
+        result["http_status"] = resp.status_code
+        result["http_ms"] = round((time.monotonic() - t0) * 1000)
+        result["body_head"] = (resp.text or "")[:200]
+    except Exception as exc:
+        result["http_error"] = repr(exc)
+    return result
 
 
 def collect_once(
@@ -112,6 +156,7 @@ def write_shard(
     results: List[Dict[str, Any]],
     duration_s: float,
     station_total: int,
+    probe: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     """把一轮结果写成一个 gzip JSONL 分片，返回路径。"""
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -149,6 +194,8 @@ def write_shard(
         "run_id": run_id,
         "repository": os.environ.get("GITHUB_REPOSITORY", ""),
     }
+    if probe:
+        meta["probe"] = probe
 
     with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as fh:
         fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
@@ -260,14 +307,30 @@ def main() -> int:
         print("[gha] 站点清单为空，退出")
         return 1
 
+    # 先做一次连通性自检，把 DNS / TCP / HTTPS 三段结果记进分片，
+    # 这样即便失败，data 分支里的分片也能说明到底卡在哪一段
+    first_station_id = next(iter(station_map.values()))
+    print("[gha] 连通性自检：{}".format(first_station_id))
+    probe = probe_api(first_station_id)
+    print("[gha] 自检结果：{}".format(json.dumps(probe, ensure_ascii=False)))
+
     t0 = time.monotonic()
     started_at, sample_time, results = collect_once(station_map, args.station_workers)
     duration_s = time.monotonic() - t0
 
+    station_ok = sum(1 for item in results if item["outlets"] is not None)
+    if station_ok == 0:
+        print("[gha] 全部 {} 站采集失败，本轮不写分片（避免 data 分支堆积空分片）".format(len(results)))
+        print("[gha] 自检明细：")
+        print(json.dumps(probe, ensure_ascii=False, indent=2))
+        return 1
+
     out_dir = Path(args.out_dir)
     if not out_dir.is_absolute():
         out_dir = (Path.cwd() / out_dir).resolve()
-    shard = write_shard(out_dir, started_at, sample_time, results, duration_s, len(station_map))
+    shard = write_shard(
+        out_dir, started_at, sample_time, results, duration_s, len(station_map), probe=probe
+    )
     if shard:
         size_kb = shard.stat().st_size / 1024
         print("[gha] 分片已写入：{}（{:.1f} KB）".format(shard, size_kb))
