@@ -136,6 +136,19 @@ Get-ScheduledTaskInfo -TaskName "ChargerHistory"
 
 ## 云端备份采集（GitHub Actions）
 
+> **⚠️ 当前状态：已停用。**
+>
+> 2026-10-20 实测结论：**GitHub 的 runner 在境外，到上游 `wemp.issks.com` 的 TCP 连接全部超时。**
+>
+> - 3 站试跑，`station_ok=0`、`duration_s=31.7`
+> - 31.7s ≈ `TIMEOUT(10s) × 3 次尝试 + 退避(0.4+0.8)`，即纯连接超时，不是接口报错
+> - 同一时刻本地自检：DNS 27ms、TCP 64ms、HTTP 200 —— 代码和接口都没问题
+> - 分片 → `data` 分支 → 合并 的链路**已验证可用**，卡住的只有「runner 到国内 API」这一段
+>
+> 上游 `116.62.21.187`（阿里云杭州）对境外 IP 的连接被丢弃。这个不是改代码能解决的，
+> 要恢复必须给 runner 一条国内出口（自建 runner / 国内代理），或者干脆换国内 VPS。
+> `collect.yml` 里的 `schedule` 已注释掉，保留 `workflow_dispatch` 便于日后验证。
+
 本地采集器的死穴是「电脑不能关机」：断电、蓝屏、系统更新重启，那一轮就永久丢了，
 而且上游接口只给当前状态，**事后无法补采**。所以想彻底补上缺漏，只能再找一个
 7×24 在线的机器同时采一份。
