@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 本地 AI 工作目录
+.workbuddy-ai/
+
+# 本地采集库：二进制、体积大（每天 30MB 级），不进 git。
+# 云端备份数据走 data 分支的 gzip 分片，不在这里。
+charge_history/charge_data/
+charge_history/logs/
+
+# 从 data 分支同步到本地的分片副本，主分支不重复存一份
+gha_data/
+
+# 打包产物
+dist/
+build/

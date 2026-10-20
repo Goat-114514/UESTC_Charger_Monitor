@@ -1,0 +1,133 @@
+name: charger-collect
+
+# 云端备份采集：本地电脑关机 / 断电时，由 GitHub 的机器继续每 20 分钟采一轮。
+#
+# 时间刻意错开本地采集器的整点刻度（本地跑 :00 / :20 / :40），
+# 云端跑 :10 / :30 / :50，两路合起来相当于 10 分钟一个采样点。
+#
+# 注意：GitHub 的定时任务不是精确闹钟，高峰期可能延迟几分钟到十几分钟，
+# 这是它的固有行为，不影响「补上缺漏」这个目的。
+
+on:
+  schedule:
+    - cron: "10,30,50 * * * *"
+  workflow_dispatch:
+    inputs:
+      station_limit:
+        description: "只采前 N 个站点（0 = 全部），用于联调"
+        required: false
+        default: "0"
+
+# 同一时间只允许一个采集任务，避免两个 runner 同时写同一个分片目录
+concurrency:
+  group: charger-collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 采集只需要 requests，不用装 PyQt5
+      - name: 安装依赖
+        run: pip install --quiet "requests>=2.28.0"
+
+      - name: 采集一轮
+        run: |
+          python charge_history/gha_collect.py \
+            --out-dir gha_data \
+            --station-limit "${{ inputs.station_limit || 0 }}"
+
+      # 万一后面推送失败，分片还能从 Actions 的产物里捞回来
+      - name: 上传分片产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ github.run_id }}
+          path: gha_data
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 提交分片到 data 分支
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "$(find gha_data -name '*.jsonl.gz' -print -quit 2>/dev/null)" ]; then
+            echo "本轮没有产出分片，跳过提交"
+            exit 0
+          fi
+
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          WORK=/tmp/charger-data
+          rm -rf "$WORK"
+
+          if git clone --quiet --branch data --single-branch --depth 1 "$REMOTE" "$WORK" 2>/dev/null; then
+            echo "已拉取 data 分支"
+          else
+            echo "data 分支还不存在，初始化一个"
+            rm -rf "$WORK"
+            mkdir -p "$WORK"
+            git -C "$WORK" init --quiet
+            git -C "$WORK" checkout --quiet -b data
+            git -C "$WORK" remote add origin "$REMOTE"
+          fi
+
+          cp -r gha_data/. "$WORK"/
+
+          git -C "$WORK" config user.name "charger-collector"
+          git -C "$WORK" config user.email "charger-collector@users.noreply.github.com"
+          git -C "$WORK" add -A
+
+          if git -C "$WORK" diff --cached --quiet; then
+            echo "没有新数据需要提交"
+            exit 0
+          fi
+
+          git -C "$WORK" commit --quiet -m "data: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3; do
+            if git -C "$WORK" push --quiet origin data; then
+              echo "分片已推送（第 ${attempt} 次尝试成功）"
+              exit 0
+            fi
+            echo "推送失败，第 ${attempt} 次，拉取后重试"
+            git -C "$WORK" pull --quiet --rebase origin data || true
+            sleep 5
+          done
+
+          echo "推送连续失败，分片仍保留在本次 Actions 产物中"
+          exit 1
+
+      - name: 写入运行摘要
+        if: always()
+        run: |
+          {
+            echo "### 充电桩云端采集"
+            echo ""
+            echo "- 触发方式：\`${{ github.event_name }}\`"
+            echo "- 运行编号：\`${{ github.run_id }}\`"
+            if [ -d gha_data ]; then
+              for f in $(find gha_data -name '*.jsonl.gz' | sort); do
+                echo "- 分片：\`$f\`（$(du -h "$f" | cut -f1)）"
+                echo ""
+                echo '```json'
+                gzip -dc "$f" | head -n 1
+                echo '```'
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
