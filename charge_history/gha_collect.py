@@ -60,13 +60,16 @@ def collect_once(
     t0 = time.monotonic()
     results: List[Dict[str, Any]] = []
 
+    total = len(station_map)
+    print("[gha] 开始采集 {} 站，并发 {}，sample_time={}".format(total, workers, started_at))
+
     worker_count = max(1, min(workers, len(station_map)))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
             executor.submit(fetch_station, station_id): (name, station_id)
             for name, station_id in station_map.items()
         }
-        for future in as_completed(futures):
+        for done, future in enumerate(as_completed(futures), start=1):
             station_name, station_id = futures[future]
             error: Optional[str] = None
             try:
@@ -85,6 +88,13 @@ def collect_once(
                     "error": error,
                 }
             )
+            # 每站都打一行，Actions 日志里能实时看到进度，不至于以为卡死
+            if error:
+                print("[gha] {}/{} {}({}) 失败: {}".format(
+                    done, total, station_name, station_id, error))
+            else:
+                print("[gha] {}/{} {}({}) {} 个插座".format(
+                    done, total, station_name, station_id, len(outlets or [])))
 
     results.sort(key=lambda item: item["station_id"])
 

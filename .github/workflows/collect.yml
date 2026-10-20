@@ -30,6 +30,10 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # 不加这个，Python 在非终端环境下会全缓冲输出，
+      # Actions 日志里采集步骤会长时间一片空白，看起来像卡死
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: 拉取代码
@@ -46,7 +50,7 @@ jobs:
 
       - name: 采集一轮
         run: |
-          python charge_history/gha_collect.py \
+          python -u charge_history/gha_collect.py \
             --out-dir gha_data \
             --station-limit "${{ inputs.station_limit || 0 }}"
 
@@ -57,7 +61,7 @@ jobs:
         with:
           name: shard-${{ github.run_id }}
           path: gha_data
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 7
 
       - name: 提交分片到 data 分支
@@ -68,8 +72,8 @@ jobs:
           set -uo pipefail
 
           if [ -z "$(find gha_data -name '*.jsonl.gz' -print -quit 2>/dev/null)" ]; then
-            echo "本轮没有产出分片，跳过提交"
-            exit 0
+            echo "::error::本轮没有产出任何分片（采集步骤可能被取消或中途失败），无可提交内容"
+            exit 1
           fi
 
           REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
